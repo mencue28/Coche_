@@ -1,0 +1,69 @@
+// Definición de pines y parámetros de la señal PWM (50 Hz)
+const int servoPin = 18;
+// La variable canalPWM ya no es necesaria en la versión 3.0+
+const int frecuencia = 50;    // 50 Hz, periodo de 20 ms
+const int resolucion = 10;    // Resolución de 10 bits (0 a 1023)
+
+// El servo y la driección no van con el mismo ángulo (relación de transmisión), calibrada en el coche 
+
+const int duty_mas45 = 55;  // Teórica: -45º = 0.0625 * 1023 = 63.93        Real 0.0537 (-76.68º)
+const int duty_centro = 76;   // Teórica: 0º = 0.075 * 1023 = 76.72           Real 0.0742 (-2.88º)
+const int duty_menos45 = 95;    // Teórica: +45º = 0.0875 * 1023 = 89.51        Real 0.0929 (64.08º)
+int duty_value;
+
+// Función transferencia: D = 0.075 + (angulo/3600)
+// Angulo = (D - 0.075) * 3600
+
+void moverDireccion(long angulo_deseado) {
+  int duty_value;
+
+  // Límite de seguridad mecánico
+  if (angulo_deseado < -45) angulo_deseado = -45;
+  if (angulo_deseado > 45) angulo_deseado = 45;
+
+  // Cálculo del Duty Cycle asimétrico
+  if (angulo_deseado < 0) {
+    duty_value = map(angulo_deseado, -45, 0, duty_menos45, duty_centro);
+  } else {
+    duty_value = map(angulo_deseado, 0, 45, duty_centro, duty_mas45);
+  }
+  
+  // Actuación del servo
+  ledcWrite(servoPin, duty_value);
+  
+  // Monitorización 
+  Serial.print("Angulo configurado: ");
+  Serial.print(angulo_deseado);
+  Serial.print("º -> Duty Cycle: ");
+  Serial.println(duty_value);
+}
+// =========================================================================
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Inicialización del pin del servo
+  ledcAttach(servoPin, frecuencia, resolucion);
+
+  // Inicializar en cero
+  Serial.println("Inicio: 0º");
+  moverDireccion(0); 
+  delay(1000);
+  
+  Serial.println("Introduce un ángulo:");
+}
+
+void loop() {
+  // Datos en serial monitor (Para pruebas)
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim(); 
+    
+    if (input.length() > 0) {
+      long angulo_leido = input.toInt(); 
+      
+      // Llamada directa a la función
+      moverDireccion(angulo_leido); 
+    }
+  }
+}
