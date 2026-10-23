@@ -1,0 +1,255 @@
+// PARA YO ENTERARME, PINES USADOS: 09, 10, 13, 16, 17, 18, 25, 26, 27, 36, 39
+
+// Primero escribe las librerías a incluir, luego la declaración de variables (a priori pines)
+// Librerías
+#include <Arduino.h>
+// Declaraciones
+  // Ultrasónico
+int URECHO = 27;
+int URTRIG = 26;
+  // Servo
+const int servoPin = 18;
+const int frecuencia = 50;
+const int resolucion = 10;
+const int duty_mas45 = 55;
+const int duty_centro = 76; 
+const int duty_menos45 = 95;
+int duty_value;
+  // Motores
+const int PIN_RPWM = 25;
+//const int PIN_LPWM = 13;
+//const int PIN_R_EN = 36;
+//const int PIN_L_EN = 39;
+const uint32_t PWM_FREQ = 20000;   // Hz
+const uint8_t  PWM_BITS = 10;
+const uint32_t HOLD_S   = 5;       // segundos por punto
+const uint32_t INICIO_S = 5;
+const float D_INICIO = 0.0f, D_FIN = 1.0f, D_PASO = 0.1f;
+const int N_CONF = 2;
+const int CONF[N_CONF][2] = { {1, 0}, {0, 1} };   // (En1, En2)
+const uint32_t PWM_MAX = (1u << PWM_BITS) - 1;
+
+// Cosas que no sé describir jjajajaa
+HardwareSerial SerialTF1(1); // Pines 16 y 17
+HardwareSerial SerialTF2(2); // Pines 09 y 10
+
+// Variables de control
+float er_1 = 0.0f; 
+float er_2 = 0.0f;
+float servo_1 = 0.0f;
+
+// Funciones inicialización para que c++ no explote
+int Distancia_Ultrasonico(int URTRIG, int URECHO);
+void iniciarSensores(void);
+int leerDistancia(int pinRX, int pinTX);
+void moverDireccion(long angulo_deseado);
+void pwmInit(void);
+void pwmWriteR(uint32_t v);
+void pwmWriteL(uint32_t v);
+void aplicar(int en1, int en2, float D);
+void parar(void);
+void ControlPared(float distancia, float *er_1, float *er_2, float *servo_1);
+
+// Variables para el loop
+
+int d = 0;
+
+void setup() {
+  Serial.begin(115200);
+  // Ultrasónico
+  // pinMode(URTRIG, OUTPUT);                 
+  // digitalWrite(URTRIG, HIGH);              
+  // pinMode(URECHO, INPUT);
+  // Lida
+  iniciarSensores();
+  // Servo
+  // ledcAttach(servoPin, frecuencia, resolucion);
+  // moverDireccion(0); 
+  // delay(1000);
+  // Motores
+  //pinMode(PIN_R_EN, OUTPUT);
+  //pinMode(PIN_L_EN, OUTPUT);
+  //pwmInit();
+  //parar();
+  delay(1000);
+
+
+}
+
+void loop() {
+  
+  d = leerDistancia(16, 17);
+  if (d >= 0) {
+    ControlPared(d, &er_1, &er_2, &servo_1);
+    Serial.print("Sensor 1: ");
+    Serial.print(d);
+    Serial.println(" cm");
+  }
+  //delay(100);
+
+
+}
+
+// Funciones desarrolladas
+
+// Ultrasónico
+int Distancia_Ultrasonico(int URTRIG, int URECHO){
+  digitalWrite(URTRIG, LOW);
+  delayMicroseconds(20);
+  digitalWrite(URTRIG, HIGH);              
+  unsigned long LowLevelTime = pulseIn(URECHO, LOW) ;
+  unsigned long DistanceMeasured = 0;
+  if (LowLevelTime >= 50000)
+  {DistanceMeasured=0;}
+  else
+  {DistanceMeasured = (LowLevelTime + 64.893)/50.695 ;}
+  return DistanceMeasured;
+}
+// Laser
+void iniciarSensores() {
+  SerialTF1.begin(115200, SERIAL_8N1, 16, 17);
+  //SerialTF2.begin(115200, SERIAL_8N1, 9, 10); //A priori sin usar de momento
+}
+int leerDistancia(int pinRX, int pinTX) {
+  HardwareSerial *sensor;
+
+  if (pinRX == 16 && pinTX == 17) {
+    sensor = &SerialTF1;
+  } else if (pinRX == 25 && pinTX == 26) {
+    sensor = &SerialTF2;
+  } else {
+    return -1;
+  }
+
+  static uint8_t buffer1[9], buffer2[9];
+  static uint8_t indice1 = 0, indice2 = 0;
+
+  uint8_t *buffer = (sensor == &SerialTF1) ? buffer1 : buffer2;
+  uint8_t &indice = (sensor == &SerialTF1) ? indice1 : indice2;
+
+  while (sensor->available()) {
+    uint8_t dato = sensor->read();
+
+    if (indice == 0 && dato != 0x59) continue;
+    if (indice == 1 && dato != 0x59) {
+      indice = 0;
+      continue;
+    }
+
+    buffer[indice++] = dato;
+
+    if (indice >= 9) {
+      indice = 0;
+
+      uint8_t checksum = 0;
+      for (int i = 0; i < 8; i++) checksum += buffer[i];
+
+      if (checksum == buffer[8]) {
+        return buffer[2] | (buffer[3] << 8);
+      }
+    }
+  }
+  return -1;
+}
+// Servo
+void moverDireccion(long angulo_deseado) {
+  int duty_value;
+
+  // Límite de seguridad mecánico
+  if (angulo_deseado < -45) angulo_deseado = -45;
+  if (angulo_deseado > 45) angulo_deseado = 45;
+
+  // Cálculo del Duty Cycle asimétrico
+  if (angulo_deseado < 0) {
+    duty_value = map(angulo_deseado, -45, 0, duty_menos45, duty_centro);
+  } else {
+    duty_value = map(angulo_deseado, 0, 45, duty_centro, duty_mas45);
+  }
+  
+  // Actuación del servo
+  ledcWrite(servoPin, duty_value);
+  
+
+}
+// Motor, hay más de una función
+
+/*void pwmInit() { //Inicializa la pwm, se pone en el setup y te olvidas entiendo
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_RPWM, PWM_FREQ, PWM_BITS);
+  ledcAttach(PIN_LPWM, PWM_FREQ, PWM_BITS);
+  #else
+  ledcSetup(0, PWM_FREQ, PWM_BITS); ledcAttachPin(PIN_RPWM, 0);
+  ledcSetup(1, PWM_FREQ, PWM_BITS); ledcAttachPin(PIN_LPWM, 1);
+  #endif
+}
+void pwmWriteR(uint32_t v) { //Se utiliza dentro de la función que controla la velocidad, a priori ignorable
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_RPWM, v);
+  #else
+  ledcWrite(0, v);
+  #endif
+}
+void pwmWriteL(uint32_t v) { //Se utiliza dentro de la función que controla la velocidad, a priori ignorable
+  #if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_LPWM, v);
+  #else
+  ledcWrite(1, v);
+  #endif
+}
+// (En1 - En2) = +1 -> RPWM = D ; -1 -> LPWM = D ; 0 -> todo a 0
+void aplicar(int en1, int en2, float D) { //Si no me equivoco es la que controla la velocidad
+  D = constrain(D, 0.0f, 1.0f);
+  uint32_t duty = (uint32_t)round(D * PWM_MAX);
+  int s = en1 - en2;
+  digitalWrite(PIN_R_EN, HIGH);
+  digitalWrite(PIN_L_EN, HIGH);
+  pwmWriteR(s > 0 ? duty : 0);
+  pwmWriteL(s < 0 ? duty : 0);
+}
+void parar() { //Para los motores
+  pwmWriteR(0); pwmWriteL(0);
+  digitalWrite(PIN_R_EN, LOW);
+  digitalWrite(PIN_L_EN, LOW);
+}*/
+void ControlPared(float distancia, float *er_1, float *er_2, float *servo_1){
+
+  // Punto de op: 100cm, 75 servo.
+
+  float servo;
+  float servo_inc;
+  const int servomax= 95;
+  const int servomin= 55;
+  float ref = 100;
+  float er;
+
+  float Kp = 0.3;
+  float Kd = 0;
+  float Ki = 0;
+  float Ts = 0.1;
+
+  float q0 = Kp + Ki * Ts + Kd/Ts;
+  float q1 = -Kp -(2.0*Kd)/Ts;
+  float q2 = Kd/Ts;
+
+  er = distancia - ref;
+
+  // Control
+
+  servo_inc = q0 * er + q1 * (*er_1) + q2 * (*er_2);
+
+  servo = servo_inc + (*servo_1);
+
+  // Saturación
+
+  if(servo > servomax)
+    servo = servomax;
+  if(servo < servomin)
+    servo = servomin;
+
+    moverDireccion(servo);
+
+  // Variables incrementales
+    *er_2 = *er_1;
+    *er_1 = er;
+    *servo_1 = servo;
+}
