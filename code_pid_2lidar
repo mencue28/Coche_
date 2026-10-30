@@ -1,0 +1,447 @@
+// =====================================================================
+//  COCHE_LAB - SCADA web + 2 lidar + control de distancia a la pared
+//
+//  Geometría (ejes del coche: x = largo hacia el capó, y = ancho hacia la pared)
+//    - Lidar TRASERO   : pines RX16/TX17  -> d_tra
+//    - Lidar DELANTERO : pines RX19/TX4   -> d_del  (junto a las ruedas que giran)
+//    - Separación entre ambos: S_CM = 26 cm
+//
+//    psi    = atan( (d_tra - d_del) / S )     (>0: el morro apunta hacia la pared)
+//    d_perp = (d_del + d_tra)/2 * cos(psi)    (distancia perpendicular desde los sensores)
+//
+//  Control (modo automático), delta = ángulo de ruedas, >0 = girar hacia la pared:
+//    delta = Kp*e + Ki*Integral(e) - Kpsi*psi        con e = d_perp - ref
+//  Si el coche gira al revés de lo esperado: casilla "invertir signo".
+//
+//  Uso: WiFi "COCHE_LAB" (clave coche1234) y abrir http://192.168.4.1
+//  Requiere core ESP32 de Arduino 3.x (ledcAttach(pin, freq, bits)).
+// =====================================================================
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <math.h>
+
+// ---------------- WiFi ----------------
+const char* AP_SSID = "COCHE_LAB";
+const char* AP_PASS = "coche1234";          // mínimo 8 caracteres
+
+// ---------------- Pines ----------------
+const int servoPin = 18;
+const int PIN_RPWM = 25;
+const int PIN_LPWM = 23;
+// Enables del IBT-2: la FireBeetle ESP32 NO tiene GPIO32 ni GPIO33.
+// R_EN y L_EN deben ir cableados al VCC del IBT-2 (siempre habilitados) y aquí = -1.
+const int PIN_R_EN = -1;
+const int PIN_L_EN = -1;
+// Lidar TF
+const int LIDAR_TRAS_RX = 16, LIDAR_TRAS_TX = 17;   // trasero  (UART1)
+const int LIDAR_DEL_RX  = 19, LIDAR_DEL_TX  = 4;    // delantero (UART2)
+
+// ---------------- Servo ----------------
+const int frecuencia = 50;
+const int resolucion = 10;
+const int duty_mas45 = 55;
+const int duty_centro = 76;
+const int duty_menos45 = 95;
+
+// ---------------- Motor ----------------
+const uint32_t PWM_FREQ = 20000;            // Hz
+const uint8_t  PWM_BITS = 10;
+const uint32_t PWM_MAX  = (1u << PWM_BITS) - 1;
+
+// ---------------- Seguridad / tiempos ----------------
+const uint32_t TIMEOUT_MS    = 500;         // sin órdenes -> parar
+const uint32_t LIDAR_TOUT_MS = 300;         // lidar sin datos nuevos -> no válido
+const float RAMPA_PCT_S      = 150.0f;      // aceleración máx. (% por segundo)
+const uint32_t TS_MS         = 20;          // periodo del lazo de actuación
+const uint32_t TS_PID_MS     = 100;         // periodo del control (Ts = 0.1 s)
+
+// ---------------- Geometría ----------------
+const float S_CM = 26.0f;                   // separación entre lidar (cm)
+
+// ---------------- Lidar ----------------
+struct Lidar {
+  HardwareSerial* s;
+  uint8_t  buf[9];
+  uint8_t  idx;
+  uint16_t cm;                              // última distancia válida (cm)
+  uint32_t t;                               // instante de la última trama válida
+};
+HardwareSerial SerialTras(1);
+HardwareSerial SerialDel(2);
+Lidar lidarTras = { &SerialTras, {0}, 0, 0, 0 };
+Lidar lidarDel  = { &SerialDel,  {0}, 0, 0, 0 };
+
+// Medidas derivadas
+bool  sens_ok = false;
+float d_del = 0, d_tra = 0, psi_deg = 0, d_perp = 0;
+
+// ---------------- Controlador ----------------
+float ref_cm = 100.0f;                      // referencia de d_perp: 1 m
+float Kp = 0.5f;                            // °/cm
+float Ki = 0.0f;                            // °/(cm·s)
+float Kpsi = 0.5f;                          // °/°
+const float Ts = 0.1f;
+bool  invertir = false;
+const float SERVO_MAX = 45.0f, SERVO_MIN = -45.0f;
+float uI = 0.0f;                            // estado integral (grados)
+
+// ---------------- Estado del mando ----------------
+WebServer server(80);
+volatile int consigna_v = 0;                // -100..100 %
+volatile int consigna_a = 0;                // -45..45 grados (manual)
+bool modo_auto = false;
+float v_actual = 0.0f;
+float servo_ang = 0.0f;                     // ángulo aplicado (grados)
+bool auto_prev = false;
+uint32_t t_ultimo_cmd = 0;
+uint32_t t_ultimo_ts  = 0;
+uint32_t t_pid        = 0;
+
+// ---------------- Página SCADA ----------------
+const char PAGINA[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>COCHE_LAB - SCADA</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#10151c;color:#e8edf3;margin:0;padding:20px;max-width:760px;margin:auto}
+ h1{font-size:20px;margin:0 0 14px}
+ .card{background:#1a222d;border-radius:12px;padding:16px;margin-bottom:14px}
+ .row{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+ .big{font-size:34px;font-weight:700}
+ input[type=range]{width:100%;height:36px}
+ input[type=number]{width:80px;font-size:15px;padding:6px;border-radius:6px;border:0;background:#2a3647;color:#e8edf3}
+ button{font-size:16px;padding:12px 18px;border:0;border-radius:8px;cursor:pointer;margin-right:8px}
+ #stop{background:#d62f2f;color:#fff;font-weight:700;font-size:20px;width:100%;padding:18px;margin:0}
+ .sec{background:#2a3647;color:#e8edf3}
+ .act{background:#2f7de1;color:#fff}
+ #est{font-size:13px;opacity:.8}
+ .ok{color:#4cd37b}.mal{color:#ff6b6b}
+ canvas{width:100%;height:160px;background:#121a24;border-radius:8px}
+ label{margin-right:12px;font-size:14px}
+ #pid{margin-top:12px}
+</style></head><body>
+<h1>COCHE_LAB &middot; Mando <span id="est" class="mal">sin conexión</span></h1>
+
+<div class="card">
+ <div class="row"><span>Distancia perpendicular a la pared</span><span class="big"><span id="dd">--</span> cm</span></div>
+ <div class="row">
+  <small>Delantero: <b id="d1">--</b> cm</small>
+  <small>Trasero: <b id="d2">--</b> cm</small>
+  <small>&psi;: <b id="ps">--</b> &deg;</small>
+  <small>Ref: <b id="rr">100</b> cm</small>
+  <small>Error: <b id="ee">--</b> cm</small>
+  <small id="ls" class="mal">sin lidar</small></div>
+ <canvas id="gr" width="700" height="160"></canvas>
+ <small>Azul: distancia perpendicular &middot; Verde discontinua: referencia (últimos 30 s)</small>
+</div>
+
+<div class="card">
+ <div class="row"><span>Modo de dirección</span>
+  <span><button id="bm" class="act">Manual</button><button id="ba" class="sec">Automático</button></span></div>
+ <div id="pid">
+  <label>Ref (cm) <input id="ref" type="number" value="100" step="5"></label>
+  <label>Kp (&deg;/cm) <input id="kp" type="number" value="0.5" step="0.05"></label>
+  <label>Ki <input id="ki" type="number" value="0" step="0.01"></label>
+  <label>K&psi; (&deg;/&deg;) <input id="kpsi" type="number" value="0.5" step="0.05"></label>
+  <label><input id="inv" type="checkbox"> invertir signo</label>
+ </div>
+</div>
+
+<div class="card">
+ <div class="row"><span>Velocidad</span><span class="big"><span id="vv">0</span> %</span></div>
+ <input id="v" type="range" min="-100" max="100" value="0" step="1">
+ <div class="row"><small>&larr; marcha atrás</small><small>adelante &rarr;</small></div>
+ <p>Límite de velocidad: <b><span id="lv">30</span> %</b></p>
+ <input id="lim" type="range" min="5" max="100" value="30" step="5">
+</div>
+
+<div class="card">
+ <div class="row"><span>Ángulo de giro <small id="ma">(manual)</small></span><span class="big"><span id="aa">0</span> &deg;</span></div>
+ <input id="a" type="range" min="-45" max="45" value="0" step="1">
+ <div class="row"><small>&larr; -45&deg;</small><small>+45&deg; &rarr;</small></div>
+ <button class="sec" id="cen">Centrar volante</button>
+ <button class="sec" id="cero">Velocidad 0</button>
+</div>
+
+<button id="stop">PARADA (espacio)</button>
+<p><small>Teclado: W/S o &uarr;/&darr; = acelerar/frenar, A/D o &larr;/&rarr; = girar (solo manual), espacio = parada.<br>
+Si se pierde la conexión el coche se detiene solo a los 0,5 s.</small></p>
+
+<script>
+const $=id=>document.getElementById(id);
+const v=$('v'),a=$('a'),lim=$('lim');
+let cmdV=0,cmdA=0,modo=0;
+const N=300, hist=new Array(N).fill(null);
+const num=id=>parseFloat($(id).value)||0;
+
+function limitar(){const L=+lim.value;let x=+v.value;if(x>L)x=L;if(x<-L)x=-L;v.value=x;return x;}
+function refrescar(){
+  cmdV=limitar(); cmdA=+a.value;
+  $('vv').textContent=cmdV; $('lv').textContent=lim.value;
+  if(modo===0) $('aa').textContent=cmdA;
+  $('rr').textContent=num('ref');
+}
+function setModo(m){
+  modo=m;
+  $('bm').className=m===0?'act':'sec';
+  $('ba').className=m===1?'act':'sec';
+  a.disabled=(m===1);
+  $('ma').textContent=m===1?'(automático)':'(manual)';
+}
+v.oninput=a.oninput=lim.oninput=refrescar;
+['ref','kp','ki','kpsi'].forEach(i=>$(i).oninput=refrescar);
+$('bm').onclick=()=>setModo(0);
+$('ba').onclick=()=>setModo(1);
+$('cen').onclick=()=>{a.value=0;refrescar()};
+$('cero').onclick=()=>{v.value=0;refrescar()};
+function parada(){v.value=0;refrescar()}
+$('stop').onclick=parada;
+document.onkeydown=e=>{
+  if(e.target.tagName==='INPUT'&&e.target.type==='number')return;
+  const k=e.key.toLowerCase();
+  if(k==='w'||k==='arrowup'){v.value=+v.value+5}
+  else if(k==='s'||k==='arrowdown'){v.value=+v.value-5}
+  else if((k==='a'||k==='arrowleft')&&modo===0){a.value=+a.value-5}
+  else if((k==='d'||k==='arrowright')&&modo===0){a.value=+a.value+5}
+  else if(k===' '){e.preventDefault();parada();return}
+  else return;
+  refrescar();
+};
+
+function dibujar(){
+  const c=$('gr'),g=c.getContext('2d'),W=c.width,H=c.height;
+  g.clearRect(0,0,W,H);
+  const ref=num('ref');
+  const vals=hist.filter(x=>x!==null);
+  const ym=Math.max(200,ref*1.5,...vals);
+  const Y=x=>H-8-(x/ym)*(H-16);
+  g.strokeStyle='#4cd37b';g.lineWidth=1.5;g.setLineDash([6,4]);
+  g.beginPath();g.moveTo(0,Y(ref));g.lineTo(W,Y(ref));g.stroke();g.setLineDash([]);
+  g.strokeStyle='#5aa9ff';g.lineWidth=2;g.beginPath();let pen=false;
+  hist.forEach((x,i)=>{
+    if(x===null){pen=false;return;}
+    const px=i/(N-1)*W;
+    if(!pen){g.moveTo(px,Y(x));pen=true}else g.lineTo(px,Y(x));
+  });
+  g.stroke();
+  g.fillStyle='#9fb0c3';g.font='12px sans-serif';
+  g.fillText(ym.toFixed(0)+' cm',4,12);g.fillText('0',4,H-2);
+}
+
+let enVuelo=false;
+async function enviar(){
+  if(enVuelo)return; enVuelo=true;
+  const q='/cmd?v='+cmdV+'&a='+cmdA+'&m='+modo+'&ref='+num('ref')+
+          '&kp='+num('kp')+'&ki='+num('ki')+'&kpsi='+num('kpsi')+
+          '&inv='+($('inv').checked?1:0);
+  try{
+    const r=await fetch(q,{cache:'no-store'});
+    const j=await r.json();
+    $('est').textContent='conectado';$('est').className='ok';
+    if(j.ok){
+      $('dd').textContent=j.dp.toFixed(0);
+      $('d1').textContent=j.d1; $('d2').textContent=j.d2;
+      $('ps').textContent=j.psi.toFixed(1);
+      $('ee').textContent=(j.dp-num('ref')).toFixed(0);
+      $('ls').textContent='lidar OK';$('ls').className='ok';
+    }else{
+      ['dd','d1','d2','ps','ee'].forEach(i=>$(i).textContent='--');
+      $('ls').textContent='sin lidar';$('ls').className='mal';
+    }
+    hist.push(j.ok?j.dp:null);hist.shift();dibujar();
+    if(modo===1){$('aa').textContent=j.ang.toFixed(0);a.value=j.ang;}
+  }catch(e){$('est').textContent='sin conexión';$('est').className='mal'}
+  enVuelo=false;
+}
+setInterval(enviar,100);
+setModo(0);refrescar();dibujar();
+</script></body></html>
+)rawliteral";
+
+// ---------------- Lidar: lectura no bloqueante ----------------
+// Trama TF: 0x59 0x59 DistL DistH StrL StrH Temp.. Checksum (9 bytes)
+void leerLidar(Lidar &L) {
+  while (L.s->available()) {
+    uint8_t dato = L.s->read();
+
+    if (L.idx == 0 && dato != 0x59) continue;
+    if (L.idx == 1 && dato != 0x59) { L.idx = 0; continue; }
+
+    L.buf[L.idx++] = dato;
+
+    if (L.idx >= 9) {
+      L.idx = 0;
+      uint8_t checksum = 0;
+      for (int i = 0; i < 8; i++) checksum += L.buf[i];
+      if (checksum == L.buf[8]) {
+        L.cm = L.buf[2] | (L.buf[3] << 8);
+        L.t = millis();
+      }
+    }
+  }
+}
+
+bool lidarValido(const Lidar &L, uint32_t ahora) {
+  return ((ahora - L.t) <= LIDAR_TOUT_MS) && L.cm > 0 && L.cm < 1200;
+}
+
+// Calcula psi y d_perp a partir de los dos lidar
+void calcularGeometria(uint32_t ahora) {
+  sens_ok = lidarValido(lidarDel, ahora) && lidarValido(lidarTras, ahora);
+  if (!sens_ok) return;
+  d_del = lidarDel.cm;
+  d_tra = lidarTras.cm;
+  float psi = atan2f(d_tra - d_del, S_CM);          // rad, >0: morro hacia la pared
+  psi_deg = psi * 180.0f / (float)M_PI;
+  d_perp = 0.5f * (d_del + d_tra) * cosf(psi);
+}
+
+// ---------------- Servo ----------------
+void moverDireccion(long angulo_deseado) {
+  int duty_value;
+  if (angulo_deseado < -45) angulo_deseado = -45;
+  if (angulo_deseado >  45) angulo_deseado =  45;
+
+  if (angulo_deseado < 0) {
+    duty_value = map(angulo_deseado, -45, 0, duty_menos45, duty_centro);
+  } else {
+    duty_value = map(angulo_deseado, 0, 45, duty_centro, duty_mas45);
+  }
+  ledcWrite(servoPin, duty_value);
+}
+
+// ---------------- Control: PI sobre d_perp + realimentación de psi ----------------
+// delta = Kp*e + uI - Kpsi*psi ;  uI' = Ki*e   (con anti-windup por saturación)
+void controlPared() {
+  float e = d_perp - ref_cm;
+  float p = Kp * e - Kpsi * psi_deg;
+
+  // Integral con anti-windup (no integra si está saturado en el mismo sentido)
+  float u_try = p + uI;
+  bool sat_alta = (u_try >= SERVO_MAX) && (Ki * e > 0);
+  bool sat_baja = (u_try <= SERVO_MIN) && (Ki * e < 0);
+  if (!sat_alta && !sat_baja) uI += Ki * e * Ts;
+  if (uI > SERVO_MAX) uI = SERVO_MAX;
+  if (uI < SERVO_MIN) uI = SERVO_MIN;
+
+  float delta = p + uI;
+  if (delta > SERVO_MAX) delta = SERVO_MAX;
+  if (delta < SERVO_MIN) delta = SERVO_MIN;
+
+  servo_ang = invertir ? -delta : delta;
+}
+
+// ---------------- Motor ----------------
+void motorInit() {
+  if (PIN_R_EN >= 0) { pinMode(PIN_R_EN, OUTPUT); digitalWrite(PIN_R_EN, LOW); }
+  if (PIN_L_EN >= 0) { pinMode(PIN_L_EN, OUTPUT); digitalWrite(PIN_L_EN, LOW); }
+  ledcAttach(PIN_RPWM, PWM_FREQ, PWM_BITS);
+  ledcAttach(PIN_LPWM, PWM_FREQ, PWM_BITS);
+  ledcWrite(PIN_RPWM, 0);
+  ledcWrite(PIN_LPWM, 0);
+}
+
+// v en % con signo: >0 RPWM, <0 LPWM
+void motorAplicar(float v) {
+  float D = fabsf(v) / 100.0f;
+  if (D > 1.0f) D = 1.0f;
+  uint32_t duty = (uint32_t)lroundf(D * PWM_MAX);
+
+  bool activo = duty > 0;
+  if (PIN_R_EN >= 0) digitalWrite(PIN_R_EN, activo ? HIGH : LOW);
+  if (PIN_L_EN >= 0) digitalWrite(PIN_L_EN, activo ? HIGH : LOW);
+
+  ledcWrite(PIN_RPWM, v > 0 ? duty : 0);
+  ledcWrite(PIN_LPWM, v < 0 ? duty : 0);
+}
+
+// ---------------- Servidor ----------------
+void handleRoot() { server.send_P(200, "text/html", PAGINA); }
+
+void handleCmd() {
+  if (server.hasArg("v"))    consigna_v = constrain(server.arg("v").toInt(), -100, 100);
+  if (server.hasArg("a"))    consigna_a = constrain(server.arg("a").toInt(), -45, 45);
+  if (server.hasArg("m"))    modo_auto  = (server.arg("m").toInt() == 1);
+  if (server.hasArg("ref"))  ref_cm = constrain(server.arg("ref").toFloat(), 10.0f, 800.0f);
+  if (server.hasArg("kp"))   Kp   = constrain(server.arg("kp").toFloat(),   0.0f, 10.0f);
+  if (server.hasArg("ki"))   Ki   = constrain(server.arg("ki").toFloat(),   0.0f, 10.0f);
+  if (server.hasArg("kpsi")) Kpsi = constrain(server.arg("kpsi").toFloat(), 0.0f, 10.0f);
+  if (server.hasArg("inv"))  invertir = (server.arg("inv").toInt() == 1);
+  t_ultimo_cmd = millis();
+
+  char out[170];
+  snprintf(out, sizeof(out),
+           "{\"d1\":%.0f,\"d2\":%.0f,\"dp\":%.1f,\"psi\":%.1f,\"ok\":%d,\"ang\":%.1f,\"m\":%d}",
+           d_del, d_tra, d_perp, psi_deg, sens_ok ? 1 : 0, servo_ang, modo_auto ? 1 : 0);
+  server.send(200, "application/json", out);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Servo
+  ledcAttach(servoPin, frecuencia, resolucion);
+  moverDireccion(0);
+
+  // Motor
+  motorInit();
+
+  // Lidar
+  SerialTras.begin(115200, SERIAL_8N1, LIDAR_TRAS_RX, LIDAR_TRAS_TX);
+  SerialDel.begin(115200, SERIAL_8N1, LIDAR_DEL_RX, LIDAR_DEL_TX);
+
+  // WiFi (punto de acceso)
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS, 1, 0, 2);   // canal 1, visible, máx. 2 clientes
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  Serial.print("SCADA en http://");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCmd);
+  server.begin();
+
+  t_ultimo_cmd = millis();
+}
+
+void loop() {
+  server.handleClient();
+  leerLidar(lidarTras);                      // vaciar siempre los buffers
+  leerLidar(lidarDel);
+
+  uint32_t ahora = millis();
+  if (ahora - t_ultimo_ts < TS_MS) return;
+  float dt = (ahora - t_ultimo_ts) / 1000.0f;
+  t_ultimo_ts = ahora;
+
+  calcularGeometria(ahora);
+  bool enlace = (ahora - t_ultimo_cmd) <= TIMEOUT_MS;
+
+  // ----- Velocidad (siempre manual, con fail-safe y rampa) -----
+  int v_obj = enlace ? consigna_v : 0;
+  float paso = RAMPA_PCT_S * dt;
+  if      (v_actual < v_obj - paso) v_actual += paso;
+  else if (v_actual > v_obj + paso) v_actual -= paso;
+  else                              v_actual  = v_obj;
+  motorAplicar(v_actual);
+
+  // ----- Dirección: manual o automática -----
+  if (enlace && modo_auto) {
+    if (!auto_prev) {                        // acaba de entrar en automático
+      auto_prev = true;
+      uI = 0.0f;
+      t_pid = ahora;
+    }
+    // Si falta algún lidar se mantiene el último ángulo
+    if (sens_ok && (ahora - t_pid) >= TS_PID_MS) {
+      t_pid = ahora;
+      controlPared();
+    }
+  } else {
+    auto_prev = false;
+    servo_ang = enlace ? (float)consigna_a : 0.0f;
+  }
+  moverDireccion((long)lroundf(servo_ang));
+}
